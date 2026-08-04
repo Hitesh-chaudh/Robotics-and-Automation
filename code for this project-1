@@ -1,0 +1,83 @@
+from dataclasses import dataclass
+from typing import List, Optional
+
+import numpy as np
+
+from .collision import SphereObstacle
+from .trajectory import Trajectory, generate_joint_trajectory, generate_cartesian_guided_trajectory
+
+
+def _lerp_points(p0: np.ndarray, p1: np.ndarray, n: int) -> List[np.ndarray]:
+    return [p0 + (p1 - p0) * t for t in np.linspace(0.0, 1.0, n)]
+
+
+@dataclass
+class PlanResult:
+    trajectory: Trajectory
+    used_via_point: Optional[np.ndarray]
+    attempts: int
+    message: str
+
+
+def plan_collision_free_path(
+    q_start: np.ndarray,
+    point_start_xyz: np.ndarray,
+    point_goal_xyz: np.ndarray,
+    q_goal: np.ndarray,
+    obstacles: List[SphereObstacle],
+    duration: float = 5.0,
+    z_lift_candidates=(0.15, 0.20, 0.30, 0.40),
+    link_radius: float = 0.035,
+) -> PlanResult:
+    """
+    1. Try the direct A -> B joint-space quintic trajectory.
+    2. If it collides, try a Cartesian-guided reroute: lift straight up
+       above the start, traverse laterally above the obstacle field,
+       then lower straight down onto the goal. IK is solved at closely
+       spaced waypoints, each seeded from the previous solution, so the
+       arm's elbow/wrist configuration stays continuous instead of
+       jumping between independently-seeded IK solutions (the failure
+       mode described on the "Local Minima Trap" slide).
+    """
+    direct = generate_joint_trajectory(
+        q_start=q_start, q_goal=q_goal,
+        duration=duration, n_samples=200,
+        obstacles=obstacles, link_radius=link_radius,
+    )
+    if direct.collision_free:
+        return PlanResult(trajectory=direct, used_via_point=None, attempts=1,
+                           message="Direct A->B trajectory is collision-free.")
+
+    attempts = 1
+    for lift in z_lift_candidates:
+        attempts += 1
+        via1 = point_start_xyz + np.array([0.0, 0.0, lift])
+        via2 = point_goal_xyz + np.array([0.0, 0.0, lift])
+
+        waypoints = (
+            _lerp_points(point_start_xyz, via1, 8)
+            + _lerp_points(via1, via2, 12)[1:]
+            + _lerp_points(via2, point_goal_xyz, 8)[1:]
+        )
+
+        traj = generate_cartesian_guided_trajectory(
+            cartesian_waypoints=waypoints, q_seed=q_start, duration=duration,
+            obstacles=obstacles, link_radius=link_radius,
+        )
+
+        if traj.collision_free:
+            return PlanResult(
+                trajectory=traj, used_via_point=via1, attempts=attempts,
+                message=f"Direct path collided; re-planned via a lift-traverse-lower "
+                        f"reroute (+{lift:.2f} m clearance above start/goal) is "
+                        f"collision-free.",
+            )
+
+    # Nothing worked — return the direct (colliding) trajectory so the
+    # caller can inspect exactly why, same as a real planner reporting
+    # "no valid path found".
+    return PlanResult(
+        trajectory=direct, used_via_point=None, attempts=attempts,
+        message="No collision-free path found with the tried reroutes. "
+                "Direct trajectory returned for diagnostics.",
+    )
